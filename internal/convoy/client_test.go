@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -148,5 +149,49 @@ func TestAMQPResponseShape(t *testing.T) {
 	}
 	if a.BindExchange == nil || a.BindExchange.Exchange != "ex" || a.BindExchange.RoutingKey != "rk" {
 		t.Errorf("binding not folded: %+v", a)
+	}
+}
+
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var followed atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			followed.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>login</html>"))
+			return
+		}
+		http.Redirect(w, r, "/login", http.StatusFound)
+	})
+	_, err := c.CreateProject(context.Background(), "org", CreateProjectRequest{Name: "p", Type: "incoming"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusFound {
+		t.Fatalf("want a 302 APIError, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `redirected to "/login"`) {
+		t.Errorf("error should name the redirect target: %v", err)
+	}
+	if followed.Load() != 0 {
+		t.Error("redirect was followed")
+	}
+}
+
+func TestNonJSONSuccessIsAnError(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<!doctype html><html><body>Convoy dashboard</body></html>"))
+	})
+	_, err := c.CreateProject(context.Background(), "org", CreateProjectRequest{Name: "p", Type: "incoming"})
+	if err == nil || !strings.Contains(err.Error(), "isn't a Convoy API response") {
+		t.Fatalf("want a non-JSON response error, got %v", err)
+	}
+}
+
+func TestEmptySuccessBodyIsAccepted(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := c.do(context.Background(), http.MethodDelete, "/v1/x", nil, nil, nil); err != nil {
+		t.Fatalf("empty 2xx body should be fine: %v", err)
 	}
 }
