@@ -75,6 +75,11 @@ func NewClient(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	// Never follow redirects: Go would replay a POST as a GET, and the page at
+	// the end (a login page, the Convoy dashboard) would pass for a response.
+	h := *c.httpClient
+	h.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	c.httpClient = &h
 	return c, nil
 }
 
@@ -168,14 +173,25 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			continue
 		}
 
+		if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+			return &APIError{StatusCode: resp.StatusCode, Method: method, Path: path, Message: fmt.Sprintf(
+				"redirected to %q. base_url must be the Convoy API root (ending in /api), reachable without "+
+					"an authentication proxy such as Cloudflare Access in front of it", resp.Header.Get("Location"))}
+		}
+
 		var env envelope
-		_ = json.Unmarshal(raw, &env)
+		envErr := json.Unmarshal(raw, &env)
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			msg := env.Message
 			if msg == "" {
-				msg = strings.TrimSpace(string(raw))
+				msg = snippet(raw)
 			}
 			return &APIError{StatusCode: resp.StatusCode, Method: method, Path: path, Message: msg}
+		}
+		if envErr != nil && len(bytes.TrimSpace(raw)) > 0 {
+			return fmt.Errorf("convoy: %s %s returned %d with a %q body that isn't a Convoy API response (%s). "+
+				"base_url must be the Convoy API root, ending in /api", method, path, resp.StatusCode,
+				resp.Header.Get("Content-Type"), snippet(raw))
 		}
 		if out == nil || len(env.Data) == 0 || string(env.Data) == "null" {
 			return nil
@@ -185,6 +201,16 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		}
 		return nil
 	}
+}
+
+// snippet shortens a response body for error messages.
+func snippet(raw []byte) string {
+	const max = 200
+	s := strings.Join(strings.Fields(string(raw)), " ")
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
 }
 
 func bytesReader(b []byte) io.Reader {
